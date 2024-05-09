@@ -1,0 +1,28 @@
+[package]
+name = "fubukihook"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+netstack-lwip = { git = "https://github.com/xutianyi1999/netstack-lwip.git" }
+futures-util = "0.3"
+ipnet = "2"
+iprange = "0.6"
+anyhow = "1"
+socket2 = "0.5"
+netconfig = { git = "https://github.com/xutianyi1999/netconfig.git" }
+log = "0.4"
+log4rs = "1"
+arc-swap = "1"
+chrono = "0.4"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.56", features = ["Win32_Networking_WinSock"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
