@@ -166,7 +166,7 @@ async fn udp_inbound_handler(
         };
 
         debug!("{} send to {}", from, to);
-        to_socket.send(&pkt).await?;
+        to_socket.send_to(&pkt, to).await?;
         update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
     }
     Ok(())
@@ -230,17 +230,20 @@ struct HookHandle {
     rule: Rule,
 }
 
-fn parse_rules(file_path: &str) -> Result<IpRange<Ipv4Net>> {
-    let mut file = fs::File::open(file_path)?;
-    let mut buff = Vec::with_capacity(file.metadata()?.len() as usize);
-    file.read_to_end(&mut buff)?;
-
-    let mut lines = Cursor::new(buff).lines();
+fn parse_rules(file_path_list: &[&str]) -> Result<IpRange<Ipv4Net>> {
     let mut ip_range = IpRange::new();
 
-    while let Some(res) = lines.next() {
-        let line = res?;
-        ip_range.add(Ipv4Net::from_str(&line)?);
+    for file_path in file_path_list {
+        let mut file = fs::File::open(file_path)?;
+        let mut buff = Vec::with_capacity(file.metadata()?.len() as usize);
+        file.read_to_end(&mut buff)?;
+
+        let mut lines = Cursor::new(buff).lines();
+
+        while let Some(res) = lines.next() {
+            let line = res?;
+            ip_range.add(Ipv4Net::from_str(&line)?);
+        }
     }
 
     ip_range.simplify();
@@ -333,8 +336,9 @@ extern "C" fn create_hooks(fubuki_ctx: ExternalContext) -> *mut HookHandle {
         netstack_sink_tx
     });
 
-    let file_path = std::env::var("FUBUKI_RULES_FILE").unwrap();
-    let rule = Rule::Match(parse_rules(&file_path).unwrap());
+    let file_path_list = std::env::var("FUBUKI_RULES_FILE").unwrap();
+    let file_path_list = file_path_list.trim().split(',').collect::<Vec<_>>();
+    let rule = Rule::Match(parse_rules(&file_path_list).unwrap());
 
     let hook = HookHandle {
         _rt: rt,
