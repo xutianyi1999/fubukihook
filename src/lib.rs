@@ -27,6 +27,9 @@ use crate::net::{find_interface, get_ip_dst_addr, SocketExt};
 
 mod net;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Direction {
@@ -203,12 +206,12 @@ async fn tcp_inbound_handler(
     Ok(())
 }
 
-async fn netstatck_handler(mut stack_stream: SplitStream<NetStack>, ectx: ExternalContext) {
+async fn netstatck_handler(mut stack_stream: SplitStream<NetStack>, ectx: ExternalContext) -> Result<()> {
     while let Some(pkt) = stack_stream.next().await {
-        if let Ok(pkt) = pkt {
-            (ectx.packet_send_fn)(ectx.ctx, Direction::Input, pkt.as_ptr(), pkt.len());
-        }
+        let pkt = pkt?;
+        (ectx.packet_send_fn)(ectx.ctx, Direction::Input, pkt.as_ptr(), pkt.len());
     }
+    Ok(())
 }
 
 async fn netstatck_sink_handler(
@@ -244,24 +247,65 @@ fn parse_rules(file_path: &str) -> Result<IpRange<Ipv4Net>> {
     Ok(ip_range)
 }
 
+fn logger_init() -> Result<()> {
+    fn init() -> Result<()> {
+        use log4rs::append::console::ConsoleAppender;
+        use log4rs::config::{Appender, Root};
+        use log4rs::encode::pattern::PatternEncoder;
+        use log::LevelFilter;
+
+        let pattern = if cfg!(debug_assertions) {
+            "[{d(%Y-%m-%d %H:%M:%S)}] {h({l})} {f}:{L} - {m}{n}"
+        } else {
+            "[{d(%Y-%m-%d %H:%M:%S)}] {h({l})} {t} - {m}{n}"
+        };
+
+        let stdout = ConsoleAppender::builder()
+            .encoder(Box::new(PatternEncoder::new(pattern)))
+            .build();
+
+        let config = log4rs::Config::builder()
+            .appender(Appender::builder().build("stdout", Box::new(stdout)))
+            .build(
+                Root::builder()
+                    .appender("stdout")
+                    .build(LevelFilter::from_str(
+                        std::env::var("FUBUKIHOOK_LOG").as_deref().unwrap_or("ERROR"),
+                    )?),
+            )?;
+
+        log4rs::init_config(config)?;
+        Ok(())
+    }
+
+    static LOGGER_INIT: std::sync::Once = std::sync::Once::new();
+
+    LOGGER_INIT.call_once(|| {
+        init().expect("logger initialization failed");
+    });
+    Ok(())
+}
+
 #[no_mangle]
 extern "C" fn create_hooks(fubuki_ctx: ExternalContext) -> *mut HookHandle {
     let lan_ip = get_interface_addr(SocketAddr::new([1, 1, 1, 1].into(), 53)).unwrap();
     let device = find_interface(lan_ip).unwrap();
     let device = Arc::new(device);
     let rt = Runtime::new().unwrap();
+    logger_init().unwrap();
 
     let netstack_sink_tx = rt.block_on(async {
         let (stack, tcp_listener, udp_socket) = netstack_lwip::NetStack::new().unwrap();
         let (stack_sink, stack_stream) = stack.split();
         let (netstack_sink_tx, netstack_sink_rx) = tokio::sync::mpsc::channel(1024);
-
+        
         tokio::spawn({
             let device = device.clone();
             async move {
                 if let Err(e) = tcp_inbound_handler(tcp_listener, device).await {
                     error!("tcp_inbound_handler error: {:?}", e);
                 }
+                error!("tcp_inbound_handler exited");
             }
         });
 
@@ -269,14 +313,21 @@ extern "C" fn create_hooks(fubuki_ctx: ExternalContext) -> *mut HookHandle {
             if let Err(e) = udp_inbound_handler(udp_socket, device).await {
                 error!("udp_inbound_handler error: {:?}", e);
             }
+            error!("udp_inbound_handler exited");
         });
 
-        tokio::spawn(netstatck_handler(stack_stream, fubuki_ctx));
+        tokio::spawn(async move {
+            if let Err(e) = netstatck_handler(stack_stream, fubuki_ctx).await {
+                error!("netstack_handler error: {:?}", e);
+            }
+            error!("netstatck_handler exited");
+        });
 
         tokio::spawn(async move {
             if let Err(e) = netstatck_sink_handler(stack_sink, netstack_sink_rx).await {
                 error!("netstatck_sink_handler error: {:?}", e);
             }
+            error!("netstatck_sink_handler exited");
         });
 
         netstack_sink_tx

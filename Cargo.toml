@@ -19,6 +19,7 @@ log = "0.4"
 log4rs = "1"
 arc-swap = "1"
 chrono = "0.4"
+mimalloc = { version = "*", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.56", features = ["Win32_Networking_WinSock"] }
