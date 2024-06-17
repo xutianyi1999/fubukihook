@@ -5,6 +5,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::ops::Range;
 use std::time::Duration;
 
+#[allow(unused)]
 pub trait SocketExt {
     fn set_keepalive(&self) -> Result<()>;
 

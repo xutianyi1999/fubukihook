@@ -17,12 +17,11 @@ socket2 = "0.5"
 netconfig = { git = "https://github.com/xutianyi1999/netconfig.git" }
 log = "0.4"
 log4rs = "1"
-arc-swap = "1"
-chrono = "0.4"
 mimalloc = { version = "*", default-features = false }
+udpproxi = { git = "https://github.com/xutianyi1999/udpproxi.git" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.56", features = ["Win32_Networking_WinSock"] }
+windows = { version = "0.57", features = ["Win32_Networking_WinSock"] }
 
 [profile.release]
 lto = true

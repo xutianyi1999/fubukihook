@@ -3,25 +3,23 @@ extern crate log;
 
 use std::ffi::{c_char, c_void};
 use std::fs;
+use std::future::Future;
 use std::io::{self, BufRead, Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::ops::Deref;
+use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
-use arc_swap::{ArcSwap, Cache};
-use chrono::Utc;
-use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::{SplitSink, SplitStream};
 use ipnet::Ipv4Net;
 use iprange::IpRange;
-use net::get_interface_addr;
 use netstack_lwip::NetStack;
-use tokio::net::{TcpSocket, UdpSocket};
+use tokio::net::TcpSocket;
 use tokio::runtime::Runtime;
+
+use net::get_interface_addr;
 
 use crate::net::{find_interface, get_ip_dst_addr, SocketExt};
 
@@ -67,113 +65,47 @@ impl Rule {
     }
 }
 
+struct NetStackSendHalf {
+    inner: netstack_lwip::UdpSocketSendHalf
+}
+
+impl udpproxi::UdpProxiSender for NetStackSendHalf {
+    fn send<'a>(&'a self, packet: &'a [u8], from: SocketAddr, to: SocketAddr) -> impl Future<Output=io::Result<()>> + 'a + Send {
+        let res = self.inner.send_to(packet, &from, &to);
+        std::future::ready(res)
+    }
+}
+
 async fn udp_inbound_handler(
-    udp_inbound: Box<netstack_lwip::UdpSocket>,
+    udp_inbound: Pin<Box<netstack_lwip::UdpSocket>>,
     device: Arc<String>,
 ) -> Result<()> {
-    let mapping: Arc<ArcSwap<Vec<Arc<(SocketAddr, UdpSocket, AtomicI64)>>>> =
-        Arc::new(ArcSwap::from_pointee(Vec::new()));
     let (tx, mut rx) = netstack_lwip::UdpSocket::split(udp_inbound);
-    let tx = Arc::new(tx);
+    let tx = Arc::new(NetStackSendHalf{inner: tx});
 
-    let mut mapping_cache = Cache::new(&*mapping);
+    let mut proxy = udpproxi::UdpProxi::new(tx, move |_from, to| {
+        let device = device.clone();
+
+        async move {
+            let bind_addr = match to {
+                SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+                SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+            };
+
+            let to_socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+            SocketExt::bind_device(&to_socket, &device, to.is_ipv6())?;
+            Ok(to_socket)
+        }
+    });
 
     while let Some((pkt, from, to)) = rx.next().await {
-        let snap = mapping_cache.load();
-
-        let item = snap
-            .binary_search_by_key(&from, |v| (**v).0)
-            .ok()
-            .map(|i| &*snap.deref()[i]);
-
-        let insert_item;
-
-        let (_, to_socket, update_time) = match item {
-            None => {
-                let bind_addr = match to {
-                    SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-                    SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
-                };
-
-                let to_socket = UdpSocket::bind(bind_addr).await?;
-                SocketExt::bind_device(&to_socket, &device, to.is_ipv6())?;
-                insert_item = Arc::new((from, to_socket, AtomicI64::new(Utc::now().timestamp())));
-
-                mapping.rcu(|v| {
-                    let mut tmp = (**v).clone();
-
-                    match tmp.binary_search_by_key(&from, |v| (**v).0) {
-                        Ok(_) => unreachable!(),
-                        Err(i) => tmp.insert(i, insert_item.clone()),
-                    }
-                    tmp
-                });
-
-                tokio::spawn({
-                    let tx = tx.clone();
-                    let mapping = mapping.clone();
-                    let insert_item = insert_item.clone();
-
-                    async move {
-                        let (_, to_socket, update_time) = &*insert_item;
-                        let mut buff = vec![0u8; 65536];
-
-                        let fut1 = async {
-                            loop {
-                                let (len, peer) = to_socket.recv_from(&mut buff).await?;
-                                debug!("recv from {} to {}", peer, from);
-                                tx.send_to(&buff[..len], &peer, &from)?;
-                                update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
-                            }
-                        };
-
-                        let fut2 = async {
-                            loop {
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-
-                                if Utc::now().timestamp() - update_time.load(Ordering::Relaxed)
-                                    > 300
-                                {
-                                    return;
-                                }
-                            }
-                        };
-
-                        let res: io::Result<()> = tokio::select! {
-                            res = fut1 => res,
-                            _ = fut2 => Ok(())
-                        };
-
-                        if let Err(e) = res {
-                            error!("child udp handler error: {}", e);
-                        }
-
-                        mapping.rcu(|v| {
-                            let mut tmp = (**v).clone();
-
-                            match tmp.binary_search_by_key(&from, |v| (**v).0) {
-                                Ok(i) => tmp.remove(i),
-                                Err(_) => unreachable!(),
-                            };
-                            tmp
-                        });
-                    }
-                });
-
-                &*insert_item
-            }
-            Some(v) => v,
-        };
-
-        debug!("{} send to {}", from, to);
-        to_socket.send_to(&pkt, to).await?;
-        update_time.store(Utc::now().timestamp(), Ordering::Relaxed);
+        proxy.send_packet(&pkt, from, to).await?;
     }
     Ok(())
 }
 
 async fn tcp_inbound_handler(
-    mut listener: netstack_lwip::TcpListener,
+    mut listener: Pin<Box<netstack_lwip::TcpListener>>,
     device: Arc<String>,
 ) -> Result<()> {
     while let Some((mut inbound_stream, _local_addr, remote_addr)) = listener.next().await {
@@ -206,7 +138,7 @@ async fn tcp_inbound_handler(
     Ok(())
 }
 
-async fn netstatck_handler(mut stack_stream: SplitStream<NetStack>, ectx: ExternalContext) -> Result<()> {
+async fn netstatck_handler(mut stack_stream: SplitStream<Pin<Box<NetStack>>>, ectx: ExternalContext) -> Result<()> {
     while let Some(pkt) = stack_stream.next().await {
         let pkt = pkt?;
         (ectx.packet_send_fn)(ectx.ctx, Direction::Input, pkt.as_ptr(), pkt.len());
@@ -215,7 +147,7 @@ async fn netstatck_handler(mut stack_stream: SplitStream<NetStack>, ectx: Extern
 }
 
 async fn netstatck_sink_handler(
-    mut netstack_sink: SplitSink<NetStack, Vec<u8>>,
+    mut netstack_sink: SplitSink<Pin<Box<NetStack>>, Vec<u8>>,
     mut rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) -> Result<()> {
     while let Some(pkg) = rx.recv().await {
