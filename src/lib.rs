@@ -70,7 +70,7 @@ struct NetStackSendHalf {
 }
 
 impl udpproxi::UdpProxiSender for NetStackSendHalf {
-    fn send<'a>(&'a self, packet: &'a [u8], from: SocketAddr, to: SocketAddr) -> impl Future<Output=io::Result<()>> + 'a + Send {
+    fn send(&self, packet: &[u8], from: SocketAddr, to: SocketAddr) -> impl Future<Output=io::Result<()>> + Send {
         let res = self.inner.send_to(packet, &from, &to);
         std::future::ready(res)
     }
@@ -82,10 +82,9 @@ async fn udp_inbound_handler(
 ) -> Result<()> {
     let (tx, mut rx) = netstack_lwip::UdpSocket::split(udp_inbound);
     let tx = Arc::new(NetStackSendHalf{inner: tx});
+    let device = device.as_str();
 
-    let mut proxy = udpproxi::UdpProxi::new(tx, move |_from, to| {
-        let device = device.clone();
-
+    let mut proxy = udpproxi::UdpProxi::new(tx, |_from, to| {
         async move {
             let bind_addr = match to {
                 SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
@@ -93,7 +92,7 @@ async fn udp_inbound_handler(
             };
 
             let to_socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-            SocketExt::bind_device(&to_socket, &device, to.is_ipv6())?;
+            SocketExt::bind_device(&to_socket, device, to.is_ipv6())?;
             Ok(to_socket)
         }
     });
